@@ -685,7 +685,9 @@ def main(
         optimizer.zero_grad()
         x, y = data_loader.next_batch()
         x, y = x.cuda(), y.cuda()
-        loss = model.forward_loss(x, y)
+        #for mixed-precision training
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            loss = model.forward_loss(x, y)
         loss.backward()
         optimizer.step()
         print(f"step {step}, loss: {loss.item()}")
