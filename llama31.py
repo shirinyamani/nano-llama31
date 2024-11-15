@@ -45,6 +45,7 @@ class ModelArgs:
     rope_theta: float = 500000
     use_scaled_rope: bool = False
     max_batch_size: int = 32
+    max_steps: int = 1000
     max_seq_len: int = 2048
     flash: bool = False # use flash attention?
 
@@ -307,7 +308,7 @@ class Transformer(nn.Module):
         output = self.output(h).float()
         return output
 
-    def forward_loss(self, inputs: torch.Tensor, targets: torch.Tensor, ignore_index=-100):
+    def forward(self, inputs: torch.Tensor, targets: Optional[torch.Tensor] = None, ignore_index=-100):
         # for use during training
         # ignore_index can be set to e.g. self.tokenizer.pad_id in the future
         # forward the model first
@@ -324,13 +325,15 @@ class Transformer(nn.Module):
         h = self.norm(h)
         logits = self.output(h).float()
         # and then loss
-        loss = F.cross_entropy(
-            input=logits.transpose(1, 2),
-            target=targets,
-            reduction="mean",
-            ignore_index=ignore_index,
-        )
-        return loss
+        if targets is not None:
+            loss = F.cross_entropy(
+                input=logits.transpose(1, 2),
+                target=targets,
+                reduction="mean",
+                ignore_index=ignore_index,
+            )
+            return loss
+        return logits
 
     def configure_optimizers(self, learning_rate, weight_decay=0.0, betas=(0.9, 0.97), device_type='cuda'):
         train_params = []
@@ -383,6 +386,7 @@ class Llama:
         tokenizer_path: str,
         max_seq_len: int,
         max_batch_size: int,
+        max_steps:int,
         flash: bool = False,
         model_parallel_size: Optional[int] = 1,
         seed: int = 1,
@@ -391,8 +395,6 @@ class Llama:
         assert os.path.isdir(ckpt_dir), f"Checkpoint directory '{ckpt_dir}' does not exist."
         assert os.path.isfile(tokenizer_path), f"Tokenizer file '{tokenizer_path}' does not exist."
 
-        local_rank = 0
-        torch.cuda.set_device(local_rank)
         torch.manual_seed(seed) # seed must be the same in all processes
 
         start_time = time.time()
@@ -407,6 +409,7 @@ class Llama:
         model_args: ModelArgs = ModelArgs(
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
+            max_steps=max_steps,
             flash=flash,
             **params,
         )
@@ -584,6 +587,36 @@ def _load_data_shard(filename):
     assert len(tokens) == ntok, "number of tokens read does not match header?"
     return tokens
 
+# ---------------------------------- DDP -------------------------------------
+#run the training loop
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+
+#ddp setup!
+ddp = int(os.environ.get('RANK', -1)) != -1 #if ddp runnning --> make sure cuda is avaiable
+if ddp:
+    assert torch.cuda.is_available(), "We need CUDA for DDP"
+    init_process_group(backend="nccl") #currently the fastest!
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE']) #number of total GPUs
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 #logging stuff
+else: #vanilla/ single GPU/non-DDP
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process= True
+    #auto detect device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device {device}")
+# -----------------------------------------------------------------------------
 class DistributedShardedDataLoader:
     """
     This DataLoader is both:
@@ -654,16 +687,17 @@ def main(
     max_seq_len: int = 256,
     max_gen_len: int = 256,
     max_batch_size: int = 8,
+    max_steps: int=1000,
     flash: bool = True,
 ):
 
     # load the val data shard
     data_loader = DistributedShardedDataLoader(
         filename_pattern="tinystories/*_val.bin",
-        B=max_batch_size,
+        B=max_batch_size, 
         T=max_seq_len,
-        process_rank=0,
-        num_processes=1,
+        process_rank=ddp_rank,
+        num_processes=ddp_world_size,
     )
 
     llama = Llama.build(
@@ -671,27 +705,45 @@ def main(
         tokenizer_path=tokenizer_path,
         max_seq_len=max_seq_len,
         max_batch_size=max_batch_size,
+        max_steps=max_steps,
         flash=flash,
     )
 
-    total_batch_size = max_batch_size * max_seq_len
-    print(f"total_batch_size: {total_batch_size}")
-
+    total_batch_size = max_batch_size * max_seq_len * ddp_world_size
+    assert total_batch_size % (max_batch_size * max_seq_len * ddp_world_size) == 0, "make sure total_bactch_size is divisible by B*T*ddp_world_size"
+    if master_process:
+        print(f"total_batch_size: {total_batch_size}")
+    
     # super simple training loop to start
     model = llama.model
+    if ddp:
+        model =DDP(model, device_ids=[ddp_local_rank])
+    raw_model = model.module if ddp else model 
+    optimizer = raw_model.configure_optimizers(learning_rate=1e-5, weight_decay=0.0)
     model.train()
-    optimizer = model.configure_optimizers(learning_rate=1e-5, weight_decay=0.0)
-    for step in range(20):
+    for step in range(max_steps):
+        t0 = time.time()
         optimizer.zero_grad()
         x, y = data_loader.next_batch()
         x, y = x.cuda(), y.cuda()
         #for mixed-precision training
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            loss = model.forward_loss(x, y)
+            loss = model(x, y)
+        if ddp:
+            model.require_backward_grad_sync = (step == max_steps -1) #average gradients only in last backward step
         loss.backward()
         optimizer.step()
-        print(f"step {step}, loss: {loss.item()}")
-
+        if device == "cuda":
+            torch.cuda.synchronize()
+        t1 = time.time()
+        dt = t1 - t0
+        token_processed = data_loader.B * data_loader.T * ddp_world_size
+        tokens_per_sec = token_processed / dt
+        if master_process:
+            print(f"step {step}| loss: {loss.item():.4f}| tok/sec: {tokens_per_sec:.2f}")
+    if ddp:
+        destroy_process_group()
+        
     # and now generate
     model.eval()
     prompts: List[str] = [
